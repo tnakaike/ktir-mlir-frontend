@@ -71,14 +71,17 @@ that `g` is bound to `%gid` for tile `t`'s execution of the block.
 The body knows its tile id via `ktdp.get_compute_tile_id` (the same way
 every SPMD KTIR body does) and its group index via `%gid`.
 
-**Termination:** the block terminates with `ktdp.yield_partial %val : T_p`.
-The yielded value may reference SSA values from the enclosing scope —
-typical use is a thin contribution marker:
+**Termination:** the block terminates with
+`ktdp.yield_partial %val_1, ..., %val_N : T_p_1, ..., T_p_N`, yielding
+one value per partial-tensor role. The yielded values may reference SSA
+values from the enclosing scope — typical use is a thin contribution
+marker:
 
 ```mlir
 {
   ^bb0(%gid: index):
-    ktdp.yield_partial %my_partial : tensor<...>
+    ktdp.yield_partial %my_partial_1, ..., %my_partial_N
+                       : T_p_1, ..., T_p_N
 }
 ```
 
@@ -94,10 +97,10 @@ preparation" the author wants to keep adjacent to the op.
 %future = ktdp.inter_tile_produce
     producer_tiles_per_group = <affine-set>,
     groups                   = <affine-set>
-    : T_p -> !ktdp.tile_future<T_p>
+    : T_p_1, ..., T_p_N -> !ktdp.tile_future<T_p_1, ..., T_p_N>
 {
   ^bb0(%gid: index):
-    ktdp.yield_partial %val : T_p
+    ktdp.yield_partial %val_1, ..., %val_N : T_p_1, ..., T_p_N
 }
 ```
 
@@ -168,16 +171,19 @@ two additional patterns are expressible:
 
 **`groups`** — must match the corresponding `inter_tile_produce`.
 
-**`identity`** — SSA operand of type `T_p`, the neutral element for the
-combiner. The identity tensor's shape and element type must match the
-partial type `T_p` (not the rank-reduced result type `T_r`). It is a
-single SSA value, hoisted before the op and shared across all groups and
-all tiles. Combining it with any partial yields that partial.
+**`identity`** — N variadic SSA operands, one per partial-tensor role.
+Each identity tensor's shape and element type must match the corresponding
+partial type `T_p_i` (not the rank-reduced result type `T_r_i`). The
+identities are hoisted before the op and shared across all groups and all
+tiles. Combining any identity with its corresponding partial yields that
+partial.
 
 ### 4.2 Reducer region
 
-The op has a single region with a block that receives two `T_p` arguments
-(`%lhs` and `%rhs`) and terminates with `ktdp.yield_reduced %val : T_p`.
+The op has a single region with a block that receives `2N` arguments —
+`%lhs_1, ..., %lhs_N, %rhs_1, ..., %rhs_N` with each `%lhs_i` and
+`%rhs_i` of type `T_p_i` — and terminates with
+`ktdp.yield_reduced %val_1, ..., %val_N : T_p_1, ..., T_p_N`.
 
 **Purity.** The combiner must be pure — no memory effects, no calls to
 side-effecting ops. Pure tensor ops (`tensor.empty`, `linalg` on tensors,
@@ -191,21 +197,21 @@ may be scheduled in parallel.
 
 ### 4.3 Type rules
 
-`T_r` is `T_p` with the within-group tile axes collapsed (same as the
-combiner-present, no-`scatter_dimension` case in `general-inter-tile.md`
-§2.3).
+For each role `i`, `T_r_i` is `T_p_i` with the within-group tile axes
+collapsed. The same set of axes is removed for all roles.
 
 ### 4.4 Op signature
 
 ```mlir
-%reduced = ktdp.inter_tile_reduce(%future)
+%r_1, ..., %r_N = ktdp.inter_tile_reduce(%future)
     consumer_tiles_per_group = <affine-set>,
     groups                   = <affine-set>,
-    identity(%id : T_p)
-    : !ktdp.tile_future<T_p> -> T_r
+    identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
+    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
 {
-  ^bb0(%lhs: T_p, %rhs: T_p):
-    ktdp.yield_reduced %val : T_p
+  ^bb0(%lhs_1: T_p_1, ..., %lhs_N: T_p_N,
+       %rhs_1: T_p_1, ..., %rhs_N: T_p_N):
+    ktdp.yield_reduced %val_1, ..., %val_N : T_p_1, ..., T_p_N
 }
 ```
 
@@ -254,22 +260,23 @@ unspecified. Different groups' reductions proceed independently.
 
 ### 5.3 Type rules
 
-`T_r` is `T_p` with the within-group tile axes collapsed and then sliced
-along `scatter_dimension` (same as the `scatter_dimension`-present case
-in `general-inter-tile.md` §2.3).
+For each role `i`, `T_r_i` is `T_p_i` with the within-group tile axes
+collapsed and then sliced along `scatter_dimension`. The same axes and the
+same scatter split apply to all roles.
 
 ### 5.4 Op signature
 
 ```mlir
-%chunk = ktdp.inter_tile_reduce_scatter(%future)
+%chunk_1, ..., %chunk_N = ktdp.inter_tile_reduce_scatter(%future)
     consumer_tiles_per_group = <affine-set>,
     groups                   = <affine-set>,
     scatter_dimension        = <i64>,
-    identity(%id : T_p)
-    : !ktdp.tile_future<T_p> -> T_r
+    identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
+    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
 {
-  ^bb0(%lhs: T_p, %rhs: T_p):
-    ktdp.yield_reduced %val : T_p
+  ^bb0(%lhs_1: T_p_1, ..., %lhs_N: T_p_N,
+       %rhs_1: T_p_1, ..., %rhs_N: T_p_N):
+    ktdp.yield_reduced %val_1, ..., %val_N : T_p_1, ..., T_p_N
 }
 ```
 
@@ -325,9 +332,13 @@ communication patterns:
 ### 8.1 Broadcast  →  `inter_tile_produce` + `inter_tile_consume`
 
 ```mlir
-// Tile 0 loads W; future carries it to all 4 tiles.
+// 4 tiles, 1 group: tile 0 loads W; all 4 tiles compute.
+#tile_0          = affine_set<(i)[g] : (i - 4*g == 0)>
+#all_group_tiles = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 3 >= 0)>
+#single_group    = affine_set<(g) : (g == 0)>
+
 %W_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #tile_0,          // {i | i == 4*g}
+    producer_tiles_per_group = #tile_0,
     groups                   = #single_group
     : tensor<64x128xf16> -> !ktdp.tile_future<tensor<64x128xf16>>
 {
@@ -338,7 +349,7 @@ communication patterns:
 
 // Every consumer tile extracts its copy; no combiner → value passes through.
 %W_tile = ktdp.inter_tile_consume(%W_future)
-    consumer_tiles_per_group = #all_group_tiles,  // {i | 4*g <= i <= 4*g+3}
+    consumer_tiles_per_group = #all_group_tiles,
     groups                   = #single_group
     : !ktdp.tile_future<tensor<64x128xf16>> -> tensor<64x128xf16>
 
@@ -352,6 +363,10 @@ ktdp.store %C, ...
 ### 8.2 Reduce  →  `inter_tile_produce` + `inter_tile_reduce`
 
 ```mlir
+// 4 tiles per group, 8 groups (32 tiles total).
+#all_group_tiles = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 3 >= 0)>
+#all_groups      = affine_set<(g) : (g >= 0, -g + 7 >= 0)>
+
 // All tiles contribute a partial; future carries all partials.
 %partial_future = ktdp.inter_tile_produce
     producer_tiles_per_group = #all_group_tiles,
@@ -661,6 +676,10 @@ module {
 ### 8.3 Reduce-scatter  →  `inter_tile_produce` + `inter_tile_reduce_scatter`
 
 ```mlir
+// 4 tiles per group, 8 groups (32 tiles total).
+#all_group_tiles = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 3 >= 0)>
+#all_groups      = affine_set<(g) : (g >= 0, -g + 7 >= 0)>
+
 // All tiles contribute a partial.
 %partial_future = ktdp.inter_tile_produce
     producer_tiles_per_group = #all_group_tiles,
@@ -672,6 +691,7 @@ module {
 }
 
 // Reduce and scatter; each tile receives its own slice along dim 0.
+// scatter_dimension = 0 → 128-row axis split across 4 tiles; each gets <32x1x64>.
 %my_chunk = ktdp.inter_tile_reduce_scatter(%partial_future)
     consumer_tiles_per_group = #all_group_tiles,
     groups                   = #all_groups,
@@ -683,7 +703,6 @@ module {
     %sum = linalg.add ins(%lhs, %rhs ...) ...
     ktdp.yield_reduced %sum : tensor<128x1x1x64xf16>
 }
-// scatter_dimension = 0 → 128-row axis split across 4 tiles; each gets <32x1x64>.
 // Each tile holds a different slice — ownership explicit via SSA result.
 ```
 
