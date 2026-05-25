@@ -28,7 +28,7 @@ delivery ops keeps each op single-purpose and enables any combination:
 `ktdp.inter_tile_produce` returns a `!ktdp.tile_future<T_p>` SSA value.
 Each delivery op takes that future as its operand. The def-use edge from
 production to delivery encodes the happens-before ordering with no
-explicit barriers in the IR.
+explicit barriers in the IR. Corresponding production and delivery ops are expected to be adjacent in a single basic block to avoid dead locks.
 
 ---
 
@@ -157,17 +157,6 @@ SPMD code that uses the SSA value.
 `ktdp.inter_tile_produce`.
 
 **`consumer_tiles_per_group`** — tiles that receive the reduced result.
-When equal to `producer_tiles_per_group`, every contributing tile receives
-the result (all-reduce). When it is a strict subset of the producer set,
-two additional patterns are expressible:
-
-- **Reduce-to-one** (`consumer_tiles_per_group` = {1 tile}): all N tiles
-  contribute partials but only one tile receives the result. Useful when
-  one tile aggregates the output for a downstream stage (e.g., writing to
-  memory) while the remaining tiles proceed independently.
-- **Reduce-to-subset** (1 < |consumer set| < N): an M-tile subset of the
-  contributing tiles receives the result. The N − M tiles outside the
-  consumer set are not required to wait for or hold the result.
 
 **`groups`** — must match the corresponding `inter_tile_produce`.
 
@@ -223,11 +212,7 @@ when the op completes. Every consumer tile in a group holds the same
 value — that group's fully reduced result. Tiles in different groups hold
 different values (each its own group's reduction).
 
-**Non-participating tiles.** A tile not in `consumer_tiles_per_group` for
-any group must not lexically encounter the op in its execution path. When
-the union of consumer sets equals the set of all executing tiles, no guard
-is needed; otherwise a tile outside all consumer sets that reaches the op
-is a verifier error.
+**Non-participating tiles.** Results are undefined for tiles not in `consumer_tiles_per_group`.
 
 **Multi-tensor (variadic) reductions.** N ≥ 1 partials are supported.
 Argmax-style reductions, where each partial is a correlated tuple of
