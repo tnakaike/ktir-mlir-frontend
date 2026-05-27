@@ -9,14 +9,20 @@ all-reduce, and reduce-scatter.
 
 ## 1. Motivation
 
-Inter-tile communication involves two orthogonal concerns:
+Inter-tile communication involves three orthogonal concerns:
 
 1. **Production** — which tiles contribute data and what they contribute.
 2. **Delivery** — how the contributed data is delivered to the receiving
    tiles: pass-through unchanged (broadcast), folded by a combiner
    (reduce), or folded then scattered (reduce-scatter).
+3. **Synchronization granularity** — whether each consumer tile waits
+   for *all* producer tiles in its group to complete (full-barrier mode),
+   or only for the specific producers whose data it requires (per-tile
+   mode). Per-tile mode allows a consumer to begin as soon as its
+   individual dependencies are satisfied, reducing stall time when
+   producers finish at different times.
 
-Separating these concerns into a unified production op plus three
+Separating production and delivery into a unified production op plus three
 delivery ops keeps each op single-purpose and enables any combination:
 
 | Pattern | Production op | Delivery op |
@@ -28,7 +34,11 @@ delivery ops keeps each op single-purpose and enables any combination:
 `ktdp.inter_tile_produce` returns a `!ktdp.tile_future<T_p>` SSA value.
 Each delivery op takes that future as its operand. The def-use edge from
 production to delivery encodes the happens-before ordering with no
-explicit barriers in the IR. Corresponding production and delivery ops are expected to be adjacent in a single basic block to avoid dead locks.
+explicit barriers in the IR. The synchronization granularity — full-barrier
+or per-tile — is controlled by the `producer_dependency_per_consumer`
+attribute on the delivery op (§3.1, §4.1, §5.1). Corresponding production
+and delivery ops are expected to be adjacent in a single basic block to
+avoid dead locks.
 
 ---
 
@@ -104,9 +114,19 @@ preparation" the author wants to keep adjacent to the op.
 }
 ```
 
-`%future` is a workgroup-visible handle. It cannot materialize until all
-producer tiles in each group have executed the block and terminated with
-`ktdp.yield_partial`.
+`%future` is a workgroup-visible handle carrying per-tile availability
+signals. Each producer tile's contribution becomes independently
+observable the moment that tile executes `ktdp.yield_partial`. Which
+signals a consumer tile waits on is controlled by the
+`producer_dependency_per_consumer` attribute on the delivery op: absent
+means wait for all producer tiles (full-barrier mode); present means
+wait only for the declared subset (per-tile mode). See §6 for the full
+synchronization model.
+
+**Single-use invariant.** `%future` must have exactly one use — the
+single delivery op that consumes it. A second use is a verifier error.
+If two delivery ops need to communicate with the same set of producers,
+they must each have their own `ktdp.inter_tile_produce`.
 
 ---
 
@@ -122,6 +142,41 @@ constraint.
 per group.
 
 **`groups`** — must match the corresponding `inter_tile_produce`.
+
+**`producer_dependency_per_consumer`** *(optional)* — affine integer set
+`(p)[c, g]` over producer tile IDs `p`, parameterized by consumer tile
+`c` and group index `g`. For consumer tile `c` in group `g`, only the
+producer tiles satisfying this set are waited on and received by the
+delivery op. If absent, the consumer waits for all producer tiles in the
+group (full-barrier semantics).
+
+**Verifier invariants when present:**
+
+1. **Subset check.** The declared set must be a subset of
+   `producer_tiles_per_group`. Referencing a non-producer tile is a
+   verifier error.
+2. **Coverage check.** For every group `g` and every producer tile `p`
+   in `producer_tiles_per_group(g)`, at least one consumer tile `c` in
+   `consumer_tiles_per_group(g)` must satisfy
+   `producer_dependency_per_consumer(p)[c, g]`. A producer tile absent
+   from the union is a verifier error — it would yield a value that no
+   consumer ever reads, risking a deadlock in push-based lowerings.
+
+Because a `%future` has exactly one delivery op (§2.3), these invariants
+are checked locally against that single op.
+
+Not every symbol needs to appear in a given instantiation:
+
+- **`g` may be omitted** when the mapping is the same relative rule for
+  every group (group-independent mapping). Example: a fixed per-tile
+  pairing, `(p)[c] : (p - c + 2 == 0)`. Note: because groups are
+  disjoint and integer division is not affine, `g` cannot be derived
+  from `c` alone; it must appear explicitly whenever the constraint
+  involves group-relative addresses such as `4*g`.
+- **Both `c` and `g` are needed** when the mapping varies by both
+  consumer identity and group. Example: a butterfly mirror exchange,
+  `(p)[c, g] : (p + c - 8*g - 3 == 0)`, where the sum `p + c` differs
+  for each group.
 
 ### 3.2 Semantics
 
@@ -142,8 +197,9 @@ SPMD code that uses the SSA value.
 
 ```mlir
 %result = ktdp.inter_tile_consume(%future)
-    consumer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>
+    consumer_tiles_per_group         = <affine-set>,
+    groups                           = <affine-set>,
+    producer_dependency_per_consumer = <affine-set>   // optional; default: all producers
     : !ktdp.tile_future<T_p> -> T_p
 ```
 
@@ -159,6 +215,13 @@ SPMD code that uses the SSA value.
 **`consumer_tiles_per_group`** — tiles that receive the reduced result.
 
 **`groups`** — must match the corresponding `inter_tile_produce`.
+
+**`producer_dependency_per_consumer`** *(optional)* — identical in form
+to §3.1. When present, only the partials from the specified producer
+tiles are combined; contributions from the remaining producer tiles are
+treated as the identity. The result is therefore a partial reduction over
+the declared subset. If absent, all producer tiles contribute
+(full-barrier semantics).
 
 **`identity`** — N variadic SSA operands, one per partial-tensor role.
 Each identity tensor's shape and element type must match the corresponding
@@ -193,8 +256,9 @@ collapsed. The same set of axes is removed for all roles.
 
 ```mlir
 %r_1, ..., %r_N = ktdp.inter_tile_reduce(%future)
-    consumer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>,
+    consumer_tiles_per_group         = <affine-set>,
+    groups                           = <affine-set>,
+    producer_dependency_per_consumer = <affine-set>,   // optional; default: all producers
     identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
     : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
 {
@@ -226,7 +290,7 @@ two op results. The structure generalizes uniformly.
 
 ### 5.1 Operand and attributes
 
-Identical to §4.1, plus one additional attribute:
+Identical to §4.1 , plus one additional attribute:
 
 **`scatter_dimension`** (i64) — axis of the post-reduction type along
 which the result is split row-major across the consumer tiles. The size
@@ -253,9 +317,10 @@ same scatter split apply to all roles.
 
 ```mlir
 %chunk_1, ..., %chunk_N = ktdp.inter_tile_reduce_scatter(%future)
-    consumer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>,
-    scatter_dimension        = <i64>,
+    consumer_tiles_per_group         = <affine-set>,
+    groups                           = <affine-set>,
+    scatter_dimension                = <i64>,
+    producer_dependency_per_consumer = <affine-set>,   // optional; default: all producers
     identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
     : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
 {
@@ -280,22 +345,54 @@ from their respective independent reductions.
 ## 6. Synchronization model
 
 No explicit barriers appear in the IR. The `!ktdp.tile_future<T_p>` SSA
-value encodes two ordering constraints:
+value carries **per-tile availability signals** rather than a monolithic
+group barrier:
 
-1. `%future` cannot materialize until all producer tiles in each group
-   have completed their block.
-2. The delivery op (`inter_tile_consume` / `inter_tile_reduce` /
-   `inter_tile_reduce_scatter`) cannot execute until `%future` is defined.
+1. Each producer tile's contribution becomes independently observable as
+   soon as that tile executes `ktdp.yield_partial` in the production
+   block.
+2. A delivery op cannot use a producer tile's contribution until that
+   tile's signal is set in `%future`.
+3. The producer tiles a given consumer tile waits for are declared by the
+   `producer_dependency_per_consumer` attribute on the delivery op:
+
+   - **Absent (default) — full-barrier mode:** consumer tile `c` in group
+     `g` waits for every producer tile in `producer_tiles_per_group(g)`
+     before the delivery op executes. This maps directly to a hardware
+     group barrier and preserves the simplest safety guarantee.
+   - **Present — per-tile mode:** consumer tile `c` waits only for the
+     producer tiles `p` satisfying `producer_dependency_per_consumer(p)[c,
+     g]`. The consumer unblocks as soon as those specific tiles have
+     completed, without waiting for unrelated producers. Different consumer
+     tiles may declare different dependency sets, enabling fine-grained
+     producer–consumer pipelining.
+
+**Single-use invariant.** Each `%future` value has exactly one delivery
+op use. A second use is a verifier error (§2.3).
+
+**Subset invariant.** `producer_dependency_per_consumer`, when present,
+must be a subset of `producer_tiles_per_group`. Referencing a
+non-producer tile is a verifier error.
+
+**Coverage invariant.** When `producer_dependency_per_consumer` is
+present, every producer tile must be declared as a dependency by at
+least one consumer tile in the same group. Formally, for every group
+`g` and every producer `p` in `producer_tiles_per_group(g)`, there must
+exist a consumer `c` in `consumer_tiles_per_group(g)` satisfying
+`producer_dependency_per_consumer(p)[c, g]`. A producer not covered by
+any consumer is a verifier error — it yields a value that no consumer
+reads, which risks a deadlock in push-based lowerings.
 
 In SPMD KTIR, a tile cannot observe other tiles' partials except through a
 dialect-defined boundary. The `ktdp.inter_tile_produce` block is that
-boundary — it names the per-tile contribution, and the
-`!ktdp.tile_future` type enforces that delivery ops can only execute after
-all producers in the group have completed. The delivery op's result tensor
-is an SSA value that cannot materialize until the cross-tile operation
-completes; standard MLIR dataflow ordering applies.
+boundary — it names the per-tile contribution and exposes it via
+`%future`. The delivery op's result tensor is an SSA value that cannot
+materialize until the declared dependencies are satisfied; standard MLIR
+dataflow ordering applies.
 
-Lowering inserts target-specific hardware barriers.
+Lowering inserts target-specific hardware synchronization: a group barrier
+for full-barrier mode, and point-to-point ready/wait signals for per-tile
+mode.
 
 ---
 
@@ -857,6 +954,106 @@ module {
 }
 ```
 
+### 8.4 Per-tile synchronization  →  `inter_tile_consume` with `producer_dependency_per_consumer`
+
+#### 8.4.1 Per-tile pairing within a single group
+
+Four tiles per group: tiles `4g` and `4g+1` are producers, tiles `4g+2`
+and `4g+3` are consumers. Each consumer depends on its dedicated producer
+(`4g+2` ← `4g`, `4g+3` ← `4g+1`), so the pairing is `p = c - 2` — a
+constant relative offset that does not depend on the group index `g`.
+
+| group | producer | consumer |
+|-------|----------|----------|
+| 0     | 0        | 2        |
+| 0     | 1        | 3        |
+
+```mlir
+// Producers: tiles 4g, 4g+1.  Consumers: tiles 4g+2, 4g+3.
+#producer_tiles  = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 1 >= 0)>
+#consumer_tiles  = affine_set<(i)[g] : (i - 4*g - 2 >= 0, -i + 4*g + 3 >= 0)>
+#single_group    = affine_set<(g) : (g == 0)>
+
+// The pairing p = c - 2 is group-independent, so g is not needed as a symbol.
+#dep_per_consumer = affine_set<(p)[c] : (p - c + 2 == 0)>
+
+%data_future = ktdp.inter_tile_produce
+    producer_tiles_per_group = #producer_tiles,
+    groups                   = #single_group
+    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>>
+{
+  ^bb0(%gid: index):
+    %data = ktdp.load ...
+    ktdp.yield_partial %data : tensor<64xf16>
+}
+
+// Each consumer unblocks independently as its assigned producer finishes.
+%my_data = ktdp.inter_tile_consume(%data_future)
+    consumer_tiles_per_group         = #consumer_tiles,
+    groups                           = #single_group,
+    producer_dependency_per_consumer = #dep_per_consumer
+    : !ktdp.tile_future<tensor<64xf16>> -> tensor<64xf16>
+```
+
+Without `producer_dependency_per_consumer`, both consumers stall until
+both producers finish. With it, each consumer stalls only for its own
+producer, halving the worst-case wait when the two producers finish at
+different times.
+
+#### 8.4.2 Butterfly mirror exchange across multiple groups
+
+Eight groups of 4 tiles; all 4 tiles in each group both produce and
+consume. Tile `c = 4g + l` waits only for its mirror partner
+`p = 4g + (3 - l)`, equivalent to `p + c = 8g + 3`. This models a
+butterfly-style partner exchange.
+
+Both `c` and `g` are required: `c` identifies which specific consumer is
+asking (different consumers within the group have different mirrors), and
+`g` anchors the equation to the group (the target sum `8g + 3` is `3`,
+`11`, `19`, ... for groups `0`, `1`, `2`, ..., so `g` cannot be
+eliminated).
+
+| group | producer | consumer |
+|-------|----------|----------|
+| 0     | 0        | 3        |
+| 0     | 1        | 2        |
+| 0     | 2        | 1        |
+| 0     | 3        | 0        |
+| 1     | 4        | 7        |
+| 1     | 5        | 6        |
+| 1     | 6        | 5        |
+| 1     | 7        | 4        |
+| …     | …        | …        |
+
+```mlir
+// 8 groups of 4 tiles; every tile is both producer and consumer.
+#all_group_tiles  = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 3 >= 0)>
+#all_groups       = affine_set<(g) : (g >= 0, -g + 7 >= 0)>
+
+// Tile c = 4g+l waits for mirror tile p = 4g+(3-l), i.e. p + c = 8g + 3.
+// c is needed: different consumers have different mirrors within a group.
+// g is needed: the sum p + c = 8g + 3 is a different value for each group.
+#dep_per_consumer = affine_set<(p)[c, g] : (p + c - 8*g - 3 == 0)>
+
+%data_future = ktdp.inter_tile_produce
+    producer_tiles_per_group = #all_group_tiles,
+    groups                   = #all_groups
+    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>>
+{
+  ^bb0(%gid: index):
+    %data = ktdp.load ...
+    ktdp.yield_partial %data : tensor<64xf16>
+}
+
+// Each tile unblocks as soon as its single mirror partner has yielded,
+// without waiting for the other two tiles in the group.
+%partner_data = ktdp.inter_tile_consume(%data_future)
+    consumer_tiles_per_group         = #all_group_tiles,
+    groups                           = #all_groups,
+    producer_dependency_per_consumer = #dep_per_consumer
+    : !ktdp.tile_future<tensor<64xf16>> -> tensor<64xf16>
+```
+
 ---
 
 ## 9. Relationship to existing ops
@@ -900,7 +1097,8 @@ independently.
 
 **Q3. Gather pattern.**
 A fourth pattern — all tiles produce, one tile consumes the concatenation
-of all partials (no combining) — is not covered. Left as future work.
+of all partials (no combining) — is not covered. See §11.2 for a
+candidate op design.
 
 **Q4. Consume placement.**
 Whether the verifier should enforce that delivery ops appear only inside
@@ -909,9 +1107,143 @@ lowering. If the union of consumer sets equals the set of all executing
 tiles, no guard is needed; otherwise a tile not in the consumer set that
 reaches the delivery op would be a verifier error.
 
-**Q5. Multiple consumers of a single future.**
-Should a single `%future` be usable by more than one delivery op? In SSA
-a value may have multiple uses. If allowed, each use represents an
-independent extraction. This is sound but may require lowering to handle
-duplicate barrier waits. Restricting to exactly one delivery op per future
-simplifies lowering at the cost of expressiveness.
+---
+
+## 11. Possible extensions
+
+### 11.1 Multiple delivery ops per future
+
+The current spec restricts a `!ktdp.tile_future<T>` value to exactly
+one delivery op use. A natural extension would allow multiple delivery
+ops to consume the same future, with each declaring its own
+`producer_dependency_per_consumer`. This would let one
+`ktdp.inter_tile_produce` serve two independent delivery operations —
+for example, one delivery op waits for the first half of the producer
+tiles while another waits for the second half.
+
+**Expressiveness gain.** Patterns that currently require two separate
+`ktdp.inter_tile_produce` ops (with identical producer regions) could be
+expressed with a single produce op and two delivery ops. This reduces
+redundant producer-side code and makes the shared production explicit in
+the IR.
+
+**Verification complexity.** The single-use restriction keeps the
+coverage check local: the verifier inspects only the one delivery op to
+confirm every producer tile is covered. With multiple delivery ops, the
+coverage invariant must be checked globally across all uses of the
+future: for every group `g` and every producer `p` in
+`producer_tiles_per_group(g)`, at least one consumer tile `c` across
+any of the delivery ops must satisfy `producer_dependency_per_consumer(p)[c, g]`.
+This requires the verifier to collect and union the dependency sets from
+all uses of the SSA value before checking coverage — a cross-op,
+def-use-traversal analysis rather than a local per-op check.
+
+**Lowering complexity.** Each delivery op that declares a
+`producer_dependency_per_consumer` introduces its own set of
+point-to-point synchronization signals. A producer tile `p` may now
+need to signal multiple consumers across different delivery ops, and the
+lowering must ensure that all signals are emitted exactly once by `p`
+and received exactly once by each dependent consumer. In full-barrier
+mode, multiple delivery ops on the same future also require the lowering
+to handle duplicate barrier waits — a producer-side barrier cannot be
+issued until all delivery ops that depend on it are ready to receive.
+
+Given this added verification and lowering complexity, the current design
+requires separate `ktdp.inter_tile_produce` ops for separate delivery
+concerns. If future use cases demonstrate a clear need for the shared
+production pattern, this restriction can be relaxed.
+
+### 11.2 Gather — `ktdp.inter_tile_gather` (new op)
+
+**Why the current design cannot represent gather.** Gather assembles
+each producer tile's partial into a single tensor by concatenating slices
+in deterministic order — tile with local index `l` contributes the `l`-th
+slice. This ordered concatenation cannot be expressed with any existing
+delivery op:
+
+- `inter_tile_reduce` requires the combiner to be pure and
+  associative-commutative, so the scheduler is free to combine in any
+  order. Concatenation is not commutative (tile `0 ‖ 1 ≠ 1 ‖ 0`), so it
+  is not a valid combiner.
+- `inter_tile_consume` with multiple producers requires all producers to
+  hold the same value (broadcast semantics); it cannot assemble different
+  slices from different producers into one tensor.
+
+**Candidate op.**
+
+```mlir
+%gathered = ktdp.inter_tile_gather(%future)
+    consumer_tiles_per_group = <affine-set>,
+    groups                   = <affine-set>,
+    gather_dimension         = <i64>
+    : !ktdp.tile_future<T_p> -> T_g
+```
+
+**Type rule.** `T_g` is `T_p` with the size along `gather_dimension`
+multiplied by `|producer tiles per group|`. Producer tile with
+within-group local index `l` (ascending position in the group) occupies
+slice `[l*chunk : (l+1)*chunk]` along `gather_dimension` in the
+assembled output, where `chunk` is the size of `T_p` along
+`gather_dimension`.
+
+**Ordering.** Unlike the reduce combiner — which may be applied in any
+order — the placement of each producer's partial in the output is
+determined by its within-group local index. The ordering is
+deterministic and does not require commutativity.
+
+**Relationship to other ops.** Gather is the inverse of
+`inter_tile_reduce_scatter`: reduce-scatter reduces N partials then
+scatters one slice per tile; gather assembles N slices from N tiles into
+one full tensor. The table below shows how gather fits with the existing
+patterns:
+
+| Pattern | Producers per group | Delivery op | Result per consumer |
+|---------|--------------------|-----------------------------|---------------------|
+| Broadcast | 1 | `inter_tile_consume` | full copy |
+| Reduce | N | `inter_tile_reduce` | fully reduced |
+| Reduce-scatter | N | `inter_tile_reduce_scatter` | 1/N slice of reduced |
+| Gather | N | `inter_tile_gather` *(proposed)* | full assembled tensor |
+| Scatter | 1 | `inter_tile_scatter` *(proposed, §11.3)* | 1/N slice of full |
+
+### 11.3 Scatter — `ktdp.inter_tile_scatter` (new op)
+
+**Why the current design can represent scatter, but awkwardly.**
+Scatter sends a different slice of a single producer's tensor to each
+consumer tile. This is expressible today using `inter_tile_reduce_scatter`
+with a single producer per group and a trivial identity combiner: the
+reduce over one partial is the partial itself, and the scatter then
+distributes slices to consumers. However, this encoding has three
+ergonomic problems:
+
+1. The partial type must carry an artificial unit within-group tile axis
+   (e.g., `tensor<1 x 128 x 64>` instead of `tensor<128 x 64>`) because
+   `inter_tile_reduce_scatter` expects a reducible tile axis to collapse.
+2. A combiner region must be provided even though it is never meaningfully
+   invoked; any pure combiner with the correct types satisfies the
+   verifier, but the requirement is misleading.
+3. The op name `inter_tile_reduce_scatter` suggests reduction is taking
+   place, obscuring the actual intent.
+
+**Candidate op.**
+
+```mlir
+%my_slice = ktdp.inter_tile_scatter(%future)
+    consumer_tiles_per_group = <affine-set>,
+    groups                   = <affine-set>,
+    scatter_dimension        = <i64>
+    : !ktdp.tile_future<T_p> -> T_s
+```
+
+**Type rule.** `T_s` is `T_p` with the size along `scatter_dimension`
+divided by `|consumer tiles per group|`. Consumer tile with within-group
+local index `l` receives slice `[l*chunk : (l+1)*chunk]` along
+`scatter_dimension`, where `chunk = T_p[scatter_dimension] / |consumer
+tiles per group|`. The size along `scatter_dimension` must be divisible
+by the per-group consumer-tile count.
+
+**Relationship to existing ops.** `inter_tile_scatter` is to
+`inter_tile_consume` what `inter_tile_reduce_scatter` is to
+`inter_tile_reduce`: it adds a per-tile slice selection on top of the
+plain delivery, without any combining step. It is also the inverse of
+`inter_tile_gather`: gather assembles N slices into one full tensor;
+scatter splits one full tensor into N slices.
