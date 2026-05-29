@@ -116,12 +116,7 @@ preparation" the author wants to keep adjacent to the op.
 
 `%future` is a workgroup-visible handle carrying per-tile availability
 signals. Each producer tile's contribution becomes independently
-observable the moment that tile executes `ktdp.yield_partial`. Which
-signals a consumer tile waits on is controlled by the
-`producer_dependency_per_consumer` attribute on the delivery op: absent
-means wait for all producer tiles (full-barrier mode); present means
-wait only for the declared subset (per-tile mode). See §6 for the full
-synchronization model.
+observable the moment that tile executes `ktdp.yield_partial`.
 
 **Single-use invariant.** `%future` must have exactly one use — the
 single delivery op that consumes it. A second use is a verifier error.
@@ -155,12 +150,22 @@ group (full-barrier semantics).
 1. **Subset check.** The declared set must be a subset of
    `producer_tiles_per_group`. Referencing a non-producer tile is a
    verifier error.
+   ```
+   { p | ∃ c, g : producer_dependency_per_consumer(p)[c, g] }
+     ⊆
+   { p | ∃ g : p ∈ producer_tiles_per_group(g) }
+   ```
 2. **Coverage check.** For every group `g` and every producer tile `p`
    in `producer_tiles_per_group(g)`, at least one consumer tile `c` in
    `consumer_tiles_per_group(g)` must satisfy
    `producer_dependency_per_consumer(p)[c, g]`. A producer tile absent
    from the union is a verifier error — it would yield a value that no
    consumer ever reads, risking a deadlock in push-based lowerings.
+   ```
+   ∀ g, ∀ p ∈ producer_tiles_per_group(g) :
+       ∃ c ∈ consumer_tiles_per_group(g) :
+           producer_dependency_per_consumer(p)[c, g]
+   ```
 
 Because a `%future` has exactly one delivery op (§2.3), these invariants
 are checked locally against that single op.
@@ -1191,20 +1196,6 @@ order — the placement of each producer's partial in the output is
 determined by its within-group local index. The ordering is
 deterministic and does not require commutativity.
 
-**Relationship to other ops.** Gather is the inverse of
-`inter_tile_reduce_scatter`: reduce-scatter reduces N partials then
-scatters one slice per tile; gather assembles N slices from N tiles into
-one full tensor. The table below shows how gather fits with the existing
-patterns:
-
-| Pattern | Producers per group | Delivery op | Result per consumer |
-|---------|--------------------|-----------------------------|---------------------|
-| Broadcast | 1 | `inter_tile_consume` | full copy |
-| Reduce | N | `inter_tile_reduce` | fully reduced |
-| Reduce-scatter | N | `inter_tile_reduce_scatter` | 1/N slice of reduced |
-| Gather | N | `inter_tile_gather` *(proposed)* | full assembled tensor |
-| Scatter | 1 | `inter_tile_scatter` *(proposed, §11.3)* | 1/N slice of full |
-
 ### 11.3 Scatter — `ktdp.inter_tile_scatter` (new op)
 
 **Why the current design can represent scatter, but awkwardly.**
@@ -1241,9 +1232,12 @@ local index `l` receives slice `[l*chunk : (l+1)*chunk]` along
 tiles per group|`. The size along `scatter_dimension` must be divisible
 by the per-group consumer-tile count.
 
-**Relationship to existing ops.** `inter_tile_scatter` is to
-`inter_tile_consume` what `inter_tile_reduce_scatter` is to
-`inter_tile_reduce`: it adds a per-tile slice selection on top of the
-plain delivery, without any combining step. It is also the inverse of
-`inter_tile_gather`: gather assembles N slices into one full tensor;
-scatter splits one full tensor into N slices.
+### 11.4 Summary of operation coverage
+
+| Pattern | Producers per group | Delivery op | Result per consumer |
+|---------|--------------------|-----------------------------|---------------------|
+| Broadcast | 1 | `inter_tile_consume` | full copy |
+| Reduce | N | `inter_tile_reduce` | fully reduced |
+| Reduce-scatter | N | `inter_tile_reduce_scatter` | 1/N slice of reduced |
+| Gather | N | `inter_tile_gather` | full assembled tensor |
+| Scatter | 1 | `inter_tile_scatter` | 1/N slice of full |
