@@ -129,9 +129,9 @@ they must each have their own `ktdp.inter_tile_produce`.
 
 ### 3.1 Operand and attributes
 
-**Operand:** `!ktdp.tile_future<T_p>` — the future returned by the
-corresponding `ktdp.inter_tile_produce`. The def-use edge is the ordering
-constraint.
+**Operand:** `!ktdp.tile_future<T_p_1, ..., T_p_N>` — the future returned
+by the corresponding `ktdp.inter_tile_produce`. The def-use edge is the
+ordering constraint.
 
 **`consumer_tiles_per_group`** — tiles that receive the delivered value
 per group.
@@ -201,11 +201,11 @@ SPMD code that uses the SSA value.
 ### 3.3 Op signature
 
 ```mlir
-%result = ktdp.inter_tile_consume(%future)
+%result_1, ..., %result_N = ktdp.inter_tile_consume(%future)
     consumer_tiles_per_group         = <affine-set>,
     groups                           = <affine-set>,
     producer_dependency_per_consumer = <affine-set>   // optional; default: all producers
-    : !ktdp.tile_future<T_p> -> T_p
+    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_p_1, ..., T_p_N
 ```
 
 ---
