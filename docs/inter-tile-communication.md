@@ -31,14 +31,20 @@ delivery ops keeps each op single-purpose and enables any combination:
 | Reduce | `ktdp.inter_tile_produce` | `ktdp.inter_tile_reduce` |
 | Reduce-scatter | `ktdp.inter_tile_produce` | `ktdp.inter_tile_reduce_scatter` |
 
-`ktdp.inter_tile_produce` returns a `!ktdp.tile_future<T_p>` SSA value.
-Each delivery op takes that future as its operand. The def-use edge from
-production to delivery encodes the happens-before ordering with no
-explicit barriers in the IR. The synchronization granularity — full-barrier
-or per-tile — is controlled by the `producer_dependency_per_consumer`
-attribute on the delivery op (§3.1, §4.1, §5.1). Corresponding production
-and delivery ops are expected to be adjacent in a single basic block to
-avoid dead locks.
+`ktdp.inter_tile_produce` returns a `!ktdp.tile_future<T_p, #groups>` SSA
+value. The group set `#groups` is carried as a parameter of the future
+type rather than repeated as a separate `groups` attribute on both the
+production and delivery ops. Each delivery op therefore infers the groups
+from its operand type, and a group mismatch between production and
+delivery is inexpressible — the def-use edge already requires the operand
+type to equal the result type, so the type system rejects it structurally
+rather than a verifier catching it after the fact. Each delivery op takes
+that future as its operand. The def-use edge from production to delivery
+encodes the happens-before ordering with no explicit barriers in the IR.
+The synchronization granularity — full-barrier or per-tile — is controlled
+by the `producer_dependency_per_consumer` attribute on the delivery op
+(§3.1, §4.1, §5.1). Corresponding production and delivery ops are expected
+to be adjacent in a single basic block to avoid dead locks.
 
 ---
 
@@ -64,7 +70,11 @@ production.
 
 **`groups`** — affine integer set defining the range of valid group indices.
 For example, `affine_set<(g) : (g >= 0, -g + 7 >= 0)>` defines 8 groups,
-indexed `0..7`. Identical in role to the same attribute on the existing ops.
+indexed `0..7`. It bounds the range of the `g` symbol used by
+`producer_tiles_per_group`. This set is **not** a standalone attribute: it
+is carried as the trailing parameter of the result
+`!ktdp.tile_future<..., #groups>` type, and every delivery op infers it
+from its operand type (§1).
 
 ### 2.2 Producer region
 
@@ -105,9 +115,8 @@ preparation" the author wants to keep adjacent to the op.
 
 ```mlir
 %future = ktdp.inter_tile_produce
-    producer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>
-    : T_p_1, ..., T_p_N -> !ktdp.tile_future<T_p_1, ..., T_p_N>
+    producer_tiles_per_group = <affine-set>
+    : T_p_1, ..., T_p_N -> !ktdp.tile_future<T_p_1, ..., T_p_N, #groups>
 {
   ^bb0(%gid: index):
     ktdp.yield_partial %val_1, ..., %val_N : T_p_1, ..., T_p_N
@@ -129,14 +138,14 @@ they must each have their own `ktdp.inter_tile_produce`.
 
 ### 3.1 Operand and attributes
 
-**Operand:** `!ktdp.tile_future<T_p_1, ..., T_p_N>` — the future returned
-by the corresponding `ktdp.inter_tile_produce`. The def-use edge is the
-ordering constraint.
+**Operand:** `!ktdp.tile_future<T_p_1, ..., T_p_N, #groups>` — the future
+returned by the corresponding `ktdp.inter_tile_produce`. The def-use edge
+is the ordering constraint, and the `#groups` parameter of this type
+supplies the group set. There is no separate `groups` attribute; a group
+mismatch with production is inexpressible (§1).
 
 **`consumer_tiles_per_group`** — tiles that receive the delivered value
 per group.
-
-**`groups`** — must match the corresponding `inter_tile_produce`.
 
 **`producer_dependency_per_consumer`** *(optional)* — affine integer set
 `(p)[c, g]` over producer tile IDs `p`, parameterized by consumer tile
@@ -168,7 +177,11 @@ group (full-barrier semantics).
    ```
 
 Because a `%future` has exactly one delivery op (§2.3), these invariants
-are checked locally against that single op.
+are checked against that single delivery op. Note that folding `groups`
+into the future type removes only the group-match check: the subset and
+coverage checks above reference `producer_tiles_per_group`, which lives on
+the producing op, so the verifier still reads it across the def-use edge
+(that set is not carried in the type).
 
 Not every symbol needs to appear in a given instantiation:
 
@@ -203,9 +216,8 @@ SPMD code that uses the SSA value.
 ```mlir
 %result_1, ..., %result_N = ktdp.inter_tile_consume(%future)
     consumer_tiles_per_group         = <affine-set>,
-    groups                           = <affine-set>,
     producer_dependency_per_consumer = <affine-set>   // optional; default: all producers
-    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_p_1, ..., T_p_N
+    : !ktdp.tile_future<T_p_1, ..., T_p_N, #groups> -> T_p_1, ..., T_p_N
 ```
 
 ---
@@ -214,12 +226,11 @@ SPMD code that uses the SSA value.
 
 ### 4.1 Operand and attributes
 
-**Operand:** `!ktdp.tile_future<T_p>` returned by
-`ktdp.inter_tile_produce`.
+**Operand:** `!ktdp.tile_future<T_p, #groups>` returned by
+`ktdp.inter_tile_produce`. The `#groups` parameter supplies the group set;
+there is no separate `groups` attribute (§1).
 
 **`consumer_tiles_per_group`** — tiles that receive the reduced result.
-
-**`groups`** — must match the corresponding `inter_tile_produce`.
 
 **`producer_dependency_per_consumer`** *(optional)* — identical in form
 to §3.1. When present, only the partials from the specified producer
@@ -262,10 +273,9 @@ collapsed. The same set of axes is removed for all roles.
 ```mlir
 %r_1, ..., %r_N = ktdp.inter_tile_reduce(%future)
     consumer_tiles_per_group         = <affine-set>,
-    groups                           = <affine-set>,
     producer_dependency_per_consumer = <affine-set>,   // optional; default: all producers
     identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
-    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
+    : !ktdp.tile_future<T_p_1, ..., T_p_N, #groups> -> T_r_1, ..., T_r_N
 {
   ^bb0(%lhs_1: T_p_1, ..., %lhs_N: T_p_N,
        %rhs_1: T_p_1, ..., %rhs_N: T_p_N):
@@ -323,11 +333,10 @@ same scatter split apply to all roles.
 ```mlir
 %chunk_1, ..., %chunk_N = ktdp.inter_tile_reduce_scatter(%future)
     consumer_tiles_per_group         = <affine-set>,
-    groups                           = <affine-set>,
     scatter_dimension                = <i64>,
     producer_dependency_per_consumer = <affine-set>,   // optional; default: all producers
     identity(%id_1 : T_p_1, ..., %id_N : T_p_N)
-    : !ktdp.tile_future<T_p_1, ..., T_p_N> -> T_r_1, ..., T_r_N
+    : !ktdp.tile_future<T_p_1, ..., T_p_N, #groups> -> T_r_1, ..., T_r_N
 {
   ^bb0(%lhs_1: T_p_1, ..., %lhs_N: T_p_N,
        %rhs_1: T_p_1, ..., %rhs_N: T_p_N):
@@ -349,8 +358,8 @@ from their respective independent reductions.
 
 ## 6. Synchronization model
 
-No explicit barriers appear in the IR. The `!ktdp.tile_future<T_p>` SSA
-value carries **per-tile availability signals** rather than a monolithic
+No explicit barriers appear in the IR. The `!ktdp.tile_future<T_p, #groups>`
+SSA value carries **per-tile availability signals** rather than a monolithic
 group barrier:
 
 1. Each producer tile's contribution becomes independently observable as
@@ -425,9 +434,8 @@ communication patterns:
 #single_group    = affine_set<(g) : (g == 0)>
 
 %W_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #tile_0,
-    groups                   = #single_group
-    : tensor<64x128xf16> -> !ktdp.tile_future<tensor<64x128xf16>>
+    producer_tiles_per_group = #tile_0
+    : tensor<64x128xf16> -> !ktdp.tile_future<tensor<64x128xf16>, #single_group>
 {
   ^bb0(%gid: index):
     %W = ktdp.load ...
@@ -435,10 +443,10 @@ communication patterns:
 }
 
 // Every consumer tile extracts its copy; no combiner → value passes through.
+// Groups are inferred from the future's #single_group parameter.
 %W_tile = ktdp.inter_tile_consume(%W_future)
-    consumer_tiles_per_group = #all_group_tiles,
-    groups                   = #single_group
-    : !ktdp.tile_future<tensor<64x128xf16>> -> tensor<64x128xf16>
+    consumer_tiles_per_group = #all_group_tiles
+    : !ktdp.tile_future<tensor<64x128xf16>, #single_group> -> tensor<64x128xf16>
 
 // Post-delivery SPMD compute — owned by consumer_tiles_per_group.
 // Ownership verified by traversing the def-use chain from %W_tile.
@@ -456,9 +464,8 @@ ktdp.store %C, ...
 
 // All tiles contribute a partial; future carries all partials.
 %partial_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #all_group_tiles,
-    groups                   = #all_groups
-    : tensor<1x64xf16> -> !ktdp.tile_future<tensor<1x64xf16>>
+    producer_tiles_per_group = #all_group_tiles
+    : tensor<1x64xf16> -> !ktdp.tile_future<tensor<1x64xf16>, #all_groups>
 {
   ^bb0(%gid: index):
     ktdp.yield_partial %partial_2d : tensor<1x64xf16>
@@ -467,9 +474,8 @@ ktdp.store %C, ...
 // Reduce all partials; every consumer tile receives the same reduced value.
 %reduced = ktdp.inter_tile_reduce(%partial_future)
     consumer_tiles_per_group = #all_group_tiles,
-    groups                   = #all_groups,
     identity(%add_id : tensor<1x64xf16>)
-    : !ktdp.tile_future<tensor<1x64xf16>> -> tensor<1x64xf16>
+    : !ktdp.tile_future<tensor<1x64xf16>, #all_groups> -> tensor<1x64xf16>
 {
   ^bb0(%lhs: tensor<1x64xf16>, %rhs: tensor<1x64xf16>):
     %sum = linalg.add ins(%lhs, %rhs ...) ...
@@ -553,9 +559,8 @@ module {
 
     // Produce: every tile contributes its partial_2d to the future.
     %partial_future = ktdp.inter_tile_produce
-        producer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups
-        : tensor<1x64xf16> -> !ktdp.tile_future<tensor<1x64xf16>>
+        producer_tiles_per_group = #group_tiles
+        : tensor<1x64xf16> -> !ktdp.tile_future<tensor<1x64xf16>, #all_groups>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %partial_2d : tensor<1x64xf16>
@@ -565,9 +570,8 @@ module {
     // Every tile holds the same %reduced : tensor<64xf16> (all-reduce case).
     %reduced = ktdp.inter_tile_reduce(%partial_future)
         consumer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups,
         identity(%add_id : tensor<1x64xf16>)
-        : !ktdp.tile_future<tensor<1x64xf16>> -> tensor<64xf16>
+        : !ktdp.tile_future<tensor<1x64xf16>, #all_groups> -> tensor<64xf16>
     {
       ^bb0(%lhs: tensor<1x64xf16>, %rhs: tensor<1x64xf16>):
         %init = tensor.empty() : tensor<1x64xf16>
@@ -712,9 +716,9 @@ module {
 
     // Produce: every tile contributes its partial_4d to the future.
     %partial_future = ktdp.inter_tile_produce
-        producer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups
-        : tensor<128x1x1x64xf16> -> !ktdp.tile_future<tensor<128x1x1x64xf16>>
+        producer_tiles_per_group = #group_tiles
+        : tensor<128x1x1x64xf16>
+          -> !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %partial_4d : tensor<128x1x1x64xf16>
@@ -724,9 +728,9 @@ module {
     // Dim 1 (group axis) preserved. Each tile gets its group's <128x1x64>.
     %my_group_result = ktdp.inter_tile_reduce(%partial_future)
         consumer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups,
         identity(%add_id : tensor<128x1x1x64xf16>)
-        : !ktdp.tile_future<tensor<128x1x1x64xf16>> -> tensor<128x1x64xf16>
+        : !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups>
+          -> tensor<128x1x64xf16>
     {
       ^bb0(%lhs: tensor<128x1x1x64xf16>, %rhs: tensor<128x1x1x64xf16>):
         %init = tensor.empty() : tensor<128x1x1x64xf16>
@@ -769,9 +773,8 @@ module {
 
 // All tiles contribute a partial.
 %partial_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #all_group_tiles,
-    groups                   = #all_groups
-    : tensor<128x1x1x64xf16> -> !ktdp.tile_future<tensor<128x1x1x64xf16>>
+    producer_tiles_per_group = #all_group_tiles
+    : tensor<128x1x1x64xf16> -> !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups>
 {
   ^bb0(%gid: index):
     ktdp.yield_partial %partial_4d : tensor<128x1x1x64xf16>
@@ -781,10 +784,9 @@ module {
 // scatter_dimension = 0 → 128-row axis split across 4 tiles; each gets <32x1x64>.
 %my_chunk = ktdp.inter_tile_reduce_scatter(%partial_future)
     consumer_tiles_per_group = #all_group_tiles,
-    groups                   = #all_groups,
     scatter_dimension        = 0,
     identity(%add_id : tensor<128x1x1x64xf16>)
-    : !ktdp.tile_future<tensor<128x1x1x64xf16>> -> tensor<32x1x64xf16>
+    : !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups> -> tensor<32x1x64xf16>
 {
   ^bb0(%lhs: tensor<128x1x1x64xf16>, %rhs: tensor<128x1x1x64xf16>):
     %sum = linalg.add ins(%lhs, %rhs ...) ...
@@ -912,9 +914,9 @@ module {
 
     // Produce: every tile contributes its partial_4d to the future.
     %partial_future = ktdp.inter_tile_produce
-        producer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups
-        : tensor<128x1x1x64xf16> -> !ktdp.tile_future<tensor<128x1x1x64xf16>>
+        producer_tiles_per_group = #group_tiles
+        : tensor<128x1x1x64xf16>
+          -> !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %partial_4d : tensor<128x1x1x64xf16>
@@ -924,10 +926,10 @@ module {
     // Group axis (dim 1) preserved. Each tile receives <32x1x64>.
     %my_chunk = ktdp.inter_tile_reduce_scatter(%partial_future)
         consumer_tiles_per_group = #group_tiles,
-        groups                   = #all_groups,
         scatter_dimension        = 0,
         identity(%add_id : tensor<128x1x1x64xf16>)
-        : !ktdp.tile_future<tensor<128x1x1x64xf16>> -> tensor<32x1x64xf16>
+        : !ktdp.tile_future<tensor<128x1x1x64xf16>, #all_groups>
+          -> tensor<32x1x64xf16>
     {
       ^bb0(%lhs: tensor<128x1x1x64xf16>, %rhs: tensor<128x1x1x64xf16>):
         %init = tensor.empty() : tensor<128x1x1x64xf16>
@@ -983,9 +985,8 @@ constant relative offset that does not depend on the group index `g`.
 #dep_per_consumer = affine_set<(p)[c] : (p - c + 2 == 0)>
 
 %data_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #producer_tiles,
-    groups                   = #single_group
-    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>>
+    producer_tiles_per_group = #producer_tiles
+    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>, #single_group>
 {
   ^bb0(%gid: index):
     %data = ktdp.load ...
@@ -995,9 +996,8 @@ constant relative offset that does not depend on the group index `g`.
 // Each consumer unblocks independently as its assigned producer finishes.
 %my_data = ktdp.inter_tile_consume(%data_future)
     consumer_tiles_per_group         = #consumer_tiles,
-    groups                           = #single_group,
     producer_dependency_per_consumer = #dep_per_consumer
-    : !ktdp.tile_future<tensor<64xf16>> -> tensor<64xf16>
+    : !ktdp.tile_future<tensor<64xf16>, #single_group> -> tensor<64xf16>
 ```
 
 Without `producer_dependency_per_consumer`, both consumers stall until
@@ -1041,9 +1041,8 @@ eliminated).
 #dep_per_consumer = affine_set<(p)[c, g] : (p + c - 8*g - 3 == 0)>
 
 %data_future = ktdp.inter_tile_produce
-    producer_tiles_per_group = #all_group_tiles,
-    groups                   = #all_groups
-    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>>
+    producer_tiles_per_group = #all_group_tiles
+    : tensor<64xf16> -> !ktdp.tile_future<tensor<64xf16>, #all_groups>
 {
   ^bb0(%gid: index):
     %data = ktdp.load ...
@@ -1054,9 +1053,8 @@ eliminated).
 // without waiting for the other two tiles in the group.
 %partner_data = ktdp.inter_tile_consume(%data_future)
     consumer_tiles_per_group         = #all_group_tiles,
-    groups                           = #all_groups,
     producer_dependency_per_consumer = #dep_per_consumer
-    : !ktdp.tile_future<tensor<64xf16>> -> tensor<64xf16>
+    : !ktdp.tile_future<tensor<64xf16>, #all_groups> -> tensor<64xf16>
 ```
 
 ---
@@ -1070,7 +1068,8 @@ eliminated).
 | `inter_tile_reduce` | `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` — producer block removed from the reduction op |
 | `inter_tile_reduce_scatter` | `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce_scatter` — producer block removed from the reduction op |
 
-The `!ktdp.tile_future<T>` type is shared across all ops.
+The `!ktdp.tile_future<T, #groups>` type is shared across all ops; its
+`#groups` parameter carries the group set (§1).
 
 The previous `ktdp.inter_tile` single op (Approach B draft) is replaced
 by this four-op design: `ktdp.inter_tile` had producer and optional
@@ -1118,8 +1117,8 @@ reaches the delivery op would be a verifier error.
 
 ### 11.1 Multiple delivery ops per future
 
-The current spec restricts a `!ktdp.tile_future<T>` value to exactly
-one delivery op use. A natural extension would allow multiple delivery
+The current spec restricts a `!ktdp.tile_future<T, #groups>` value to
+exactly one delivery op use. A natural extension would allow multiple delivery
 ops to consume the same future, with each declaring its own
 `producer_dependency_per_consumer`. This would let one
 `ktdp.inter_tile_produce` serve two independent delivery operations —
@@ -1179,9 +1178,8 @@ delivery op:
 ```mlir
 %gathered = ktdp.inter_tile_gather(%future)
     consumer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>,
     gather_dimension         = <i64>
-    : !ktdp.tile_future<T_p> -> T_g
+    : !ktdp.tile_future<T_p, #groups> -> T_g
 ```
 
 **Type rule.** `T_g` is `T_p` with the size along `gather_dimension`
@@ -1220,9 +1218,8 @@ ergonomic problems:
 ```mlir
 %my_slice = ktdp.inter_tile_scatter(%future)
     consumer_tiles_per_group = <affine-set>,
-    groups                   = <affine-set>,
     scatter_dimension        = <i64>
-    : !ktdp.tile_future<T_p> -> T_s
+    : !ktdp.tile_future<T_p, #groups> -> T_s
 ```
 
 **Type rule.** `T_s` is `T_p` with the size along `scatter_dimension`
