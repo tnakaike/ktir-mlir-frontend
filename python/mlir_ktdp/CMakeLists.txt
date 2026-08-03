@@ -5,7 +5,15 @@
 set(_source_components
   MLIRPythonSources.Core
   MLIRPythonSources.Dialects.builtin
-  
+  MLIRPythonSources.Dialects.func
+  MLIRPythonSources.Dialects.arith
+  MLIRPythonSources.Dialects.math
+  MLIRPythonSources.Dialects.linalg
+  MLIRPythonSources.Dialects.scf
+  MLIRPythonSources.Dialects.tensor
+  MLIRPythonSources.Dialects.memref
+  MLIRPythonSources.Dialects.complex # linalg depends on
+
   KTIRPythonSources
   KTIRPythonExtensions
 )

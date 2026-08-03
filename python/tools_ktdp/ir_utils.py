@@ -35,7 +35,11 @@ def walk_module(source: str) -> None:
 
     operations = []
     def _walk_op(op, depth: int) -> None:
-        operations.append((op, depth))
+        # Normalize to the generic Operation. Iterating ``block.operations``
+        # yields dialect OpView subclasses (e.g. ``func.FuncOp``) whose ``.name``
+        # returns the symbol name, not the op name; ``.operation.name`` is
+        # invariant to which OpView wraps the op.
+        operations.append((op.operation, depth))
         for region in op.regions:
             for block in region.blocks:
                 for child in block.operations:
