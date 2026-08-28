@@ -64,12 +64,12 @@ means a tensor or tile axis.
 
 | Op | combine | placement | producers/grp | consumers/grp | dim attrs | region | identity |
 |---|---|---|---|---|---|---|---|
-| `consume` | none | replicate | 1 | free | — | — | — |
+| `consume` | none | replicate | 1 per consumer | free | — | — | — |
 | `reduce` | fold | replicate | all | free | — | combiner | yes |
 | `reduce_scatter` | fold | split | all | free | `scatter_dimensions` | combiner | yes |
 | `gather` | none | concat | all | free | `gather_dimensions` | — | — |
 | `all_to_all` | none | permute | all | all | `split_dimensions`, `concat_dimensions` | — | — |
-| `scatter` | none | split | 1 | free | `scatter_dimensions` | — | — |
+| `scatter` | none | split | 1 per group | free | `scatter_dimensions` | — | — |
 
 `all_to_all` is listed before `scatter` because it shares the
 all-producers cardinality cell with `gather` and `reduce_scatter`, and
@@ -119,7 +119,11 @@ all-to-all from scatter.
 | Scatter | 1 | free | `inter_tile_scatter` | 1/C slice of full |
 
 `inter_tile_scatter` and `inter_tile_consume` have no natural "all-"
-variant: R8 (§5) limits them to one producer per group.
+variant: R8 (§5) gives each consumer tile exactly one source, so there is no
+all-producers case to widen to. `consume` still admits a group holding several
+producers, but only as a **routing** pattern in which the dependency attribute
+pairs each consumer tile with one of them (§6.1) — several point-to-point
+deliveries sharing one `produce`, not an all-producers delivery.
 
 ### 1.3 The future value
 
@@ -546,7 +550,7 @@ carries the attribute the rule constrains.
 | R5 dep sets pairwise disjoint | delivery | — | — | — | y | y | n/a |
 | R6 uniform dep-set cardinality | delivery | — | — | — | y | y | n/a |
 | R7 uniform producer cardinality across groups | delivery | — | — | — | y | y | n/a |
-| R8 producers per group = 1 | delivery | y | — | — | — | — | y |
+| R8 single-source delivery | delivery | y | — | — | — | — | y |
 | R9 flattened split extent divisible by `C` | delivery | — | — | y | — | y | y |
 | R10 combiner purity (§3.5) | delivery | — | y | y | — | — | — |
 | R11 identity shape matches `T_p` (§3.5) | delivery | — | y | y | — | — | — |
@@ -593,8 +597,40 @@ Statements:
   nothing otherwise requires equal cardinality per group. Since the op
   result is a single static tensor type, unequal groups yield no
   expressible result type for the assembling placements.
-- **R8 — single producer.** Exactly one producer tile per group, for the
-  ops whose `producers/grp` cell is `1`.
+- **R8 — single-source delivery.** For the ops whose `producers/grp` cell is
+  `1` — `inter_tile_consume` and `inter_tile_scatter` — every consumer tile
+  must receive from exactly one producer tile:
+
+  ```text
+  ∀ g, ∀ c ∈ consumer_tiles_per_group(g) : |dep(c, g)| == 1
+  ```
+
+  where `dep(c, g)` is the producer set `producer_dependency_per_consumer`
+  declares for consumer tile `c` (§3.4). `inter_tile_scatter` takes no such
+  attribute (§6.6), so for it the rule reduces to its simplest form: exactly
+  one producer tile per group.
+
+  **Why per consumer tile rather than per group.** These two ops deliver into a
+  result no larger than one contribution — unchanged for `replicate`, a `1/C`
+  slice for `split` — with no combiner and nowhere to put a second value. A
+  consumer tile holding two contributions is therefore the undefined cell of
+  §1.1, "which producer's value wins?". What the op needs is not that the
+  *group* hold one producer, but that each *consumer tile* have a single
+  source. The two coincide when `|P(g)| == 1`, the common case (broadcast,
+  §7.1), which needs no attribute at all.
+
+  **For `inter_tile_consume` with `|P(g)| > 1` the attribute is required.**
+  There is no meaningful default, because receiving from every producer is
+  exactly that undefined cell. With the attribute, such a group is a
+  **routing** pattern — several independent point-to-point deliveries sharing
+  one `produce` op, as in §7.4.1 and §7.4.2 — and no consumer tile ever sees
+  two values. A group with `|P(g)| > 1` and no attribute is rejected.
+
+  A producer **may** serve several consumer tiles (multicast within the
+  group); it may not serve none, which R4 already requires. So `dep` need not
+  be injective — only single-valued per consumer tile, and total over
+  producers.
+
 - **R9 — split divisibility.** `E(D_split) % C == 0`, where `D_split` is
   the op's split axis set (`scatter_dimensions`, or `split_dimensions` for
   `all_to_all`) and `E` is the flattened extent of §4. Stating the rule on the
@@ -606,7 +642,6 @@ Statements:
   list must be non-empty; and the entries must be in **ascending numerical
   order** (§4). Repeated indices would double-count an extent in `E`, and an
   out-of-order list would silently denote a different flattening.
-  Repeated indices would double-count an extent in `E`.
 - **R11 and the shipped constraint.** R11 pins `identity` to `T_p`, while
   the implemented `reduce` ties it to *results* (`KTDP.td:172-174`). With no
   rank reduction (§4) these coincide for `reduce`, since its result *is*
@@ -646,8 +681,8 @@ argument. Shared machinery is §3; rules are §5.
 
 ### 6.1 `ktdp.inter_tile_consume` — broadcast
 
-`combine = none`, `placement = replicate`, one producer per group,
-consumer set free, no dim attribute, no region, no identity.
+`combine = none`, `placement = replicate`, one producer per consumer tile
+(R8), consumer set free, no dim attribute, no region, no identity.
 
 **Result type.** `T_p_i` unchanged (§4, `replicate` + `none`).
 
@@ -662,11 +697,17 @@ group — broadcast.
     : !ktdp.tile_future<T_p_1, ..., T_p_N, #groups> -> T_p_1, ..., T_p_N
 ```
 
-With one producer per group, `producer_dependency_per_consumer` is a pure
-synchronization refinement (§3.4): it changes when each consumer
-unblocks, never what it receives. That is what makes `consume` also the
-op for one-to-one permutation exchange — a bijective dependency set over
-a multi-producer group (§7.4.2).
+With one producer per group the attribute is a pure synchronization
+refinement (§3.4): there is only one value to receive, so it changes when
+each consumer unblocks and nothing else. With **several** producers per
+group it also names the sender, and R8 then requires it — each consumer
+tile must be paired with exactly one producer. Such a group is a
+**routing** pattern rather than a broadcast: several independent
+point-to-point deliveries sharing one `produce` op, which is what lets
+`consume` express per-tile pairing (§7.4.1) and one-to-one permutation
+exchange (§7.4.2). Delivering to a consumer tile from more than one
+producer is never legal here — with no combiner and a result the size of
+one contribution, there would be nowhere to put the second value (§1.1).
 
 ### 6.2 `ktdp.inter_tile_reduce` — reduction
 
@@ -2016,12 +2057,20 @@ the Torch-Spyre SDSC planner (`_compatible_partitions`) but are absent
 from the KTIR verifier entirely — the gap exists at both the spec and the
 implementation level.
 
+**Dependency-set arity.** §3.4's one-symbol spelling `(p)[c]` is accepted as
+of `KTDPInterTileHelpers.cpp:69–100` and `KTIRCheckLegality.cpp:135–142`.
+Before that, `depTilesOf` always bound two symbols and the pass rejected any
+set whose symbol count was not exactly 2, so the group-independent form this
+document documents — and uses in §7.4.1 — was unusable in practice. The symbol
+count now selects how many values are bound, and 3-or-more is diagnosed.
+
 **Two asymmetries the verification matrix (§5) forces into the open.**
 
-1. R8 is stated as a verifier obligation for `scatter` but is merely
-   conventional for `consume`, even though both ops have the same
-   single-producer cardinality. Neither is implemented yet, so this is a
-   spec asymmetry to decide rather than inherit.
+1. R8 is a verifier obligation for both `consume` and `scatter`, but it
+   bites differently: `scatter` takes no dependency attribute, so one
+   producer per group is the whole rule, whereas `consume` admits a
+   multi-producer group whenever the attribute pairs each consumer tile with
+   exactly one producer (§5). Neither is implemented yet.
 2. R13 and R14 are implemented for `reduce` only, and R13 is the
    implementation of open question §10.1 (must a consumer also be a
    producer?) for that one op. The `?` cells in that matrix are exactly
@@ -2118,8 +2167,8 @@ fastest-varying.
 The dimension attributes are **the axis sets themselves**, in the order §4
 fixes — which is why they must be list-valued (§1.1). Rows 2–4 return
 *insufficient information* when a source region has several holders, since
-R8 admits one producer per group and the tables do not say which transmits
-(§10.2).
+R8 gives each consumer tile exactly one source and the tables do not say which
+holder transmits (§10.2).
 
 **The coverage clause of the first guard row.** Its other two clauses are
 region counts; this one is a volume — each **distinct** region's element
@@ -2278,8 +2327,9 @@ Both are §9.1 escape hatches, and both need the per-region core sets rather
 than the division.
 
 **Producer election.** Rows 2–4 return *insufficient information* when a
-source region has several holders: R8 admits one producer per group, and the
-tables record who *holds* a region, not who *transmits* it. Unforced by
+source region has several holders: R8 requires each consumer tile to have
+exactly one source, and the tables record who *holds* a region, not who
+*transmits* it. Unforced by
 measurement — every source region across the 51 files has a single holder — so
 the choice between electing a canonical producer (lowest tile id), requiring
 the frontend to pick, and rejecting replicated sources can wait.
