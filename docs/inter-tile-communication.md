@@ -2146,6 +2146,48 @@ Divide instead, extent `512` by the slice's extent `1`, and `Nd(mb) = 512`:
 `mb` would come out *refined*, on the strength of 511 pieces the table never
 mentions. Only the first reading is a fact about the tables.
 
+**How a bounded extent is expressed.** The destination above owns
+`mb[511:512]`, and no delivery op can say that. The tile sets name which
+*tiles* participate, the dimension attributes name which *axes* split or
+concatenate, and §4's type rules are extent arithmetic with no base coordinate:
+none of the six ops carries an offset.
+
+A bounded extent is therefore a property of `T_p`, and `T_p` gets it from the
+access tile the partial was loaded through. The chain is the same whatever the
+bound:
+
+```mlir
+// The extent is the access tile's shape and the offset is its anchor. Both are
+// arguments here, and neither appears again downstream.
+%access  = ktdp.construct_access_tile %view[<anchor-indices>] {
+    access_tile_set = <affine-set>, access_tile_order = <affine-map>
+} : memref<...> -> !ktdp.access_tile<...xindex>
+%partial = ktdp.load %access : !ktdp.access_tile<...xindex> -> T_p
+
+// From here the bound is invisible: the delivery op sees a T_p and an axis
+// set, never a coordinate. Selecting a different sub-tensor changes only T_p.
+%future  = ktdp.inter_tile_produce producer_tiles_per_group = <affine-set>
+    : T_p -> !ktdp.tile_future<T_p, #groups>
+{ ^bb0(%gid: index): ktdp.yield_partial %partial : T_p }
+%result  = ktdp.inter_tile_consume(%future)
+    consumer_tiles_per_group = <affine-set>
+    : !ktdp.tile_future<T_p, #groups> -> T_p
+```
+
+`ktdp.construct_access_tile` fixes the coordinates, `ktdp.load` yields the
+value, `ktdp.yield_partial` only names it, and the delivery carries whatever the
+partial turned out to be. That is why a selection is not a delivery, and why the
+coverage clause measures the value *delivered*: read as a delivery of the whole
+tensor the pair above covers 1/512 and trips the guard, while the sub-tensor it
+should have been is covered exactly.
+
+Whether a delivery is then needed at all is the ordinary classification
+question. Here it is not — each core owns a different stick of the selected row,
+so nothing crosses cores and row 1 of §9.1 gives `no op needed`. Had they all
+needed the same stick it would be a broadcast, and the load would move inside
+the producer region, since one producer per group (R8) means the non-producing
+tiles must not run it (§2.2, and §7.7.1 for the same reason on `scatter`).
+
 **Axis names versus axis indices.** Axis sets are written below with the
 backend's symbol names (`mb`, `in`, `out`, …), the vocabulary the ownership
 tables speak. The op attributes of §6 are `i64` arrays of *axis indices*
