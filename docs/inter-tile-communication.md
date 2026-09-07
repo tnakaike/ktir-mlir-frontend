@@ -125,6 +125,36 @@ producers, but only as a **routing** pattern in which the dependency attribute
 pairs each consumer tile with one of them (§6.1) — several point-to-point
 deliveries sharing one `produce`, not an all-producers delivery.
 
+**Producer–consumer relation.** One row per delivery op. The two cardinality
+columns of §1.1 say how *many* tiles take part; this table says how the two
+sets *relate*, which is what a lowering and a test fixture need. "Set" means
+`producer_tiles_per_group(g)` and `consumer_tiles_per_group(g)`.
+
+| Op | Must a consumer also be a producer? | May one producer serve several consumers? | Are the two sets equal? |
+|---|---|---|---|
+| `consume` | no | **yes** — multicast within the group (R8) | no — the common case is one producer, many consumers (§7.1) |
+| `reduce` | **yes**, current restriction only (R13, §10.1) | yes — every consumer takes the whole fold | only in the all-reduce case; `reduce_to_one` is the single-consumer case (R14) |
+| `reduce_scatter` | no | yes | not required |
+| `gather` | no | **yes** — the same producer piece appears in several consumers' assemblies | no — plain gather has one consumer, all-gather the whole group (§1.2) |
+| `all_to_all` | no | yes | **not required** — §9.3's measured non-square case has `K = 2` producers and `M = 4` consumers per group (§9.1) |
+| `scatter` | no — argued in §6.6 | yes | no |
+
+Two consequences worth stating once rather than per op.
+
+**A source may be shared by several consumers, for every delivery op.** R8
+puts it directly for the single-source ops ("a producer **may** serve several
+consumer tiles (multicast within the group)"), and it holds for the assembling
+ops too: two consumers whose declared dependency sets name the same producer
+each place that producer's contribution in their own assembly, by their own
+`P` and their own `l` order (§3.3). R5 is not a prohibition on sharing; see
+its statement in §5.
+
+**Only `reduce` requires its consumers to be producers.** For the four
+copy-only ops the question is settled by §6.6's argument — a consumer that
+receives contributes nothing, so there is nothing for it to miss — and for
+`all_to_all` the measured non-square case settles it by example. `reduce`'s
+`yes` is the restriction §10.1 describes, not a property of folding.
+
 ### 1.3 The future value
 
 `ktdp.inter_tile_produce` returns a `!ktdp.tile_future<T_p, #groups>` SSA
@@ -289,6 +319,22 @@ coincidence and break silently under non-monotone tile assignments. Every
 position — never a tile id, and never an offset in the textual order of an
 enumerated set. ("Position" rather than "rank": in this document *rank*
 always means a tensor's number of dimensions.)
+
+**Which set, when `producer_dependency_per_consumer` is present — normative.**
+For an assembling consumer the relevant producer set is **that consumer's own
+declared dependency set** `dep(c, g)`, not the whole
+`producer_tiles_per_group(g)`. So consumer `c` assembles `|dep(c, g)|` pieces
+at positions `0 .. |dep(c, g)| - 1`, ordered by ascending tile id within
+`dep(c, g)`. This is the reading §3.4 already implies by making `P` — and
+hence the result type — follow from the declared subset: a result of `P`
+chunks needs `P` consecutive positions, which only the declared subset
+supplies. Taking positions from the group's producer set instead would leave a
+non-prefix subset with no defined slots, independently of anything R5 says.
+
+A consequence worth stating: because each consumer's positions come from its
+own set, two consumers may declare **overlapping or identical** sets and each
+assembly stays well-defined — the shared-source case of §1.2, and what R5 is
+not about.
 
 ### 3.4 `producer_dependency_per_consumer` *(optional)*
 
@@ -555,7 +601,7 @@ carries the attribute the rule constrains.
 | R10 combiner purity (§3.5) | delivery | — | y | y | — | — | — |
 | R11 identity shape matches `T_p` (§3.5) | delivery | — | y | y | — | — | — |
 | R12 flattened concat extent × `P` well-defined | delivery | — | — | — | y | y | — |
-| R13 consumer set subset of producer set | delivery | — | y | ? | ? | ? | n |
+| R13 consumer set subset of producer set | delivery | — | y | n | n | n | n |
 | R14 reduce mode gate: `C == P` or `\|C\| == 1` | delivery | — | y | ? | — | — | — |
 
 Statements:
@@ -583,12 +629,24 @@ Statements:
           producer_dependency_per_consumer(p)[c, g]
   ```
 
-- **R5 — pairwise disjointness.** For the assembling placements
-  (`concat`, `permute`), distinct consumers' declared dependency sets
-  must be disjoint. R4 alone requires only that each producer be claimed
-  by *at least one* consumer, which combined with R6 admits declared sets
-  that double-count producers — and a double-counted producer has no
-  well-defined position in the assembly.
+- **R5 — pairwise disjointness, for a partitioning use only.** For the
+  assembling placements (`concat`, `permute`), when the declared dependency
+  sets are meant to *split* the producers among the consumers — a segmented
+  assembly, §3.4 — they must be pairwise disjoint. R4 alone requires only that
+  each producer be claimed by *at least one* consumer, which combined with R6
+  admits declared sets that double-count producers, and a producer claimed by
+  two segments of one partition has no single position in the assembly.
+
+  **The rule does not forbid a shared source, and is not what makes an
+  assembly well-defined.** Distinct consumers may declare identical or
+  overlapping sets: that is what an all-gather is (§6.4, every consumer
+  names every producer) and what a multicast producer is (R8).
+  Well-definedness comes from §3.3 instead — each consumer's positions are
+  taken from its *own* declared set, so its assembly is fixed whatever other
+  consumers declare. What R5 adds is only the partitioning intent: when the
+  sets are meant to split the producers, a producer in two of them belongs
+  to two segments at once. A verifier must therefore not reject overlap as
+  such.
 - **R6 — uniform dep-set cardinality.** All consumers in a group must
   declare the same number of producers, so `P` is a single number and the
   op has one static result type.
@@ -661,10 +719,17 @@ Statements:
   `all_to_all` case the divisibility follows from R7 + R9, but it must be
   stated independently for the non-square case, which §9.3 shows is
   measured and not hypothetical.
-- **R13 — consumer set subset of producer set.** Every consumer tile in a
-  group must also be a producer in that group, i.e.
-  `consumer_tiles_per_group(g) ⊆ producer_tiles_per_group(g)`. Whether
-  this should hold is §10.1; it is currently enforced for `reduce` only.
+- **R13 — consumer set subset of producer set.** Where the rule applies,
+  every consumer tile in a group must also be a producer in that group, i.e.
+  `consumer_tiles_per_group(g) ⊆ producer_tiles_per_group(g)`. **It applies
+  to `reduce` only.** For the four copy-only ops a receiving-only tile is
+  legal: §6.6's argument — a consumer that receives contributes nothing, so
+  there is nothing for it to miss — turns on `combine = none`, which all
+  four share, and not on `scatter`'s single source. `all_to_all` is settled
+  by measurement rather than by argument: §9.3's non-square case has
+  `K = 2` producers against `M = 4` consumers per group, so two of each
+  group's consumers are not producers. `reduce`'s `y` is the implementation
+  restriction described in §10.1, kept because R14's mode gate assumes it.
 - **R14 — reduce mode gate.** For `reduce`, the consumer set must either
   equal the producer set (all-reduce) or be a single tile
   (reduce-to-one); a strict multi-tile subset — reduce-to-subset — is
@@ -795,9 +860,16 @@ R5–R7.
 
 ### 6.5 `ktdp.inter_tile_all_to_all` — split and reassemble
 
-`combine = none`, `placement = permute`, all tiles produce, all tiles
-consume, both `split_dimensions` and `concat_dimensions`, no region, no
-identity.
+`combine = none`, `placement = permute`, every declared producer contributes
+and every declared consumer receives, both `split_dimensions` and
+`concat_dimensions`, no region, no identity.
+
+**The two sets need not coincide.** "All produce, all consume" means each
+delivery draws from the whole producer set and delivers to the whole consumer
+set — not that the two sets are the same tiles. §9.3's measured non-square
+case has `K = 2` producers against `M = 4` consumers per group, so a consumer
+that is not a producer is a measured shape here, and R13 is `n` for this op
+(§5).
 
 **Attributes.** `split_dimensions` (`i64` array) — axes each producer
 splits into `C` chunks (R9). `concat_dimensions` (`i64` array) — axes
@@ -2071,14 +2143,12 @@ count now selects how many values are bound, and 3-or-more is diagnosed.
    producer per group is the whole rule, whereas `consume` admits a
    multi-producer group whenever the attribute pairs each consumer tile with
    exactly one producer (§5). Neither is implemented yet.
-2. R13 and R14 are implemented for `reduce` only, and R13 is the
-   implementation of open question §10.1 (must a consumer also be a
-   producer?) for that one op. The `?` cells in that matrix are exactly
-   that question, unresolved: for `scatter` the answer is **no** (§6.6), for
-   `reduce` the current answer is **yes** (enforced), and for
-   `reduce_scatter` / `gather` / `all_to_all` it is undecided. R14's
-   mode gate is likewise a current implementation restriction, not a
-   design conclusion.
+2. R13 and R14 are implemented for `reduce` only. R13 now reads `y` for
+   `reduce` and `n` for every other op (§10.1), so what remains is an
+   implementation asymmetry rather than an open question: the enforced check
+   is the one op where the rule applies, and the four copy-only ops need no
+   check at all. R14's mode gate stays a current implementation restriction,
+   not a design conclusion.
 
 ---
 
@@ -2346,22 +2416,27 @@ restickified weights are explicitly barred as shuffle sources.
 
 ## 10. Open questions
 
-### 10.1 Must a consumer also be a producer?
+### 10.1 Must a consumer also be a producer? — resolved for the copy-only ops
 
-**What turns on it:** whether the verifier rejects a delivery op whose consumer
-set is not contained in its producer set. That check exists and runs today — R13
-for `reduce` (`KTIRCheckLegality.cpp:107–117`) — so whoever implements
-`gather`, `all_to_all` or `reduce_scatter` must decide whether to extend it,
-and the answer changes which programs are legal.
+**Resolved: no, except for `reduce`.** R13 is now `n` for `consume`,
+`reduce_scatter`, `gather`, `all_to_all` and `scatter`, and `y` for `reduce`
+alone (§5, and the relation table in §1.2).
 
-**Why it is unresolved:** `reduce`'s *yes* is one op's implementation choice,
-made when it was the only delivery op. `scatter`'s *no* is settled and
-argued (§6.6) — a consumer that receives a slice contributes nothing, so
-there is nothing to miss. Neither generalizes: `gather` and `all_to_all`
-assemble, so a non-producing consumer is coherent for them in a way it is not
-for a reduction. The `?` cells in §5 are exactly the ops still to decide, and
-R14's mode gate (all-reduce or reduce-to-one, no strict multi-tile subset) is
-a present restriction on `reduce` awaiting the same call.
+**What settled it.** §6.6's argument does not depend on `scatter`'s single
+source — it turns on `combine = none`: a consumer that receives contributes
+nothing, so there is nothing for it to miss and no coverage obligation arises.
+All four copy-only ops share `combine = none`, so the argument carries to them
+unchanged. For `all_to_all` there is also a measured instance: §9.3's
+non-square case has `K = 2` producers against `M = 4` consumers per group, so
+two consumers per group are not producers.
+
+**What is still open, and it is only about `reduce`.** `reduce`'s `y` is the
+implementation choice made when it was the only delivery op, and R14's mode
+gate (all-reduce or reduce-to-one, no strict multi-tile subset) assumes it.
+Dropping R13 for `reduce` means deciding what a fold delivered to a
+non-contributing tile means — in effect a reduce composed with a broadcast —
+and revisiting R14 in the same change. Nothing in this document requires that
+today.
 
 ### 10.2 Two things a work division cannot settle
 
